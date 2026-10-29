@@ -50,6 +50,8 @@ extern __code const uint8_t * __code const hex;
 
 extern __xdata uint8_t flash_buf[FLASH_BUF_SIZE];
 extern __xdata struct flash_region_t flash_region;
+extern __xdata uint32_t flash_size;
+extern __xdata uint8_t dio_enabled;
 
 extern __xdata char passwd[21];
 
@@ -460,12 +462,91 @@ static uint8_t name_char(uint8_t c)
 }
 
 
-// Sets the management MAC from a "mac <aa:bb:cc:dd:ee:ff>" command (or prints
+// Only erase sectors containing erased bytes outside the six-byte MAC.
+static uint8_t save_mac_to_flash(void)
+{
+	uint32_t addr = machine.mac_flash_offset;
+	uint32_t base;
+	uint16_t offset;
+	uint16_t len;
+	uint16_t pos;
+	uint16_t i;
+	uint8_t old_dio;
+
+	if (!addr) {
+		cmd_error("this machine has no MAC flash offset\n");
+		return 0;
+	}
+	if (addr >= flash_size || flash_size - addr < 6) {
+		cmd_error("MAC flash offset is outside the detected flash\n");
+		return 0;
+	}
+
+	flash_region.addr = addr;
+	flash_region.len = 6;
+	flash_read_bulk(flash_buf);
+	if (memcmp(flash_buf, mac_parse_result, 6) == 0) {
+		cmd_error("MAC is already stored at the flash offset\n");
+		return 0;
+	}
+
+	base = addr & ~((uint32_t)FLASH_SECTOR_SIZE - 1);
+	offset = addr - base;
+	len = FLASH_SECTOR_SIZE;
+	if (offset > FLASH_SECTOR_SIZE - 6)
+		len += FLASH_SECTOR_SIZE;
+	for (pos = 0; pos < len; pos += FLASH_BUF_SIZE) {
+		flash_region.addr = base + pos;
+		flash_region.len = FLASH_BUF_SIZE;
+		flash_read_bulk(flash_buf);
+		for (i = 0; i < FLASH_BUF_SIZE; i++) {
+			if ((pos + i < offset || pos + i >= offset + 6) && flash_buf[i] != 0xff) {
+				cmd_error("MAC flash sector contains other data\n");
+				return 0;
+			}
+		}
+	}
+
+	// The controller must use single IO while programming flash.
+	old_dio = dio_enabled;
+	flash_init(0);
+	for (pos = 0; pos < len; pos += FLASH_SECTOR_SIZE) {
+		flash_region.addr = base + pos;
+		flash_sector_erase();
+	}
+
+	// Split the six-byte write if it crosses a flash page boundary.
+	i = FLASH_PAGE_SIZE - (addr & (FLASH_PAGE_SIZE - 1));
+	if (i > 6)
+		i = 6;
+	flash_region.addr = addr;
+	flash_region.len = i;
+	flash_write_bytes(mac_parse_result);
+	if (i < 6) {
+		flash_region.addr = addr + i;
+		flash_region.len = 6 - i;
+		flash_write_bytes(mac_parse_result + i);
+	}
+	flash_region.addr = addr;
+	flash_region.len = 6;
+	flash_read_bulk(flash_buf);
+	flash_init(old_dio);
+	if (memcmp(flash_buf, mac_parse_result, 6) != 0) {
+		cmd_error("MAC flash verification failed\n");
+		return 0;
+	}
+	return 1;
+}
+
+
+// Sets the management MAC from a "mac <aa:bb:cc:dd:ee:ff> [save]" command (or prints
 // the current one with a bare "mac"). Refuses blank/multicast/locally
 // administered/all-zero-OUI addresses so the running MAC stays reachable, and
 // re-registers the static L2 management entry so the change applies without a
 // reboot. As a regular command a "mac ..." line in the startup config applies
-// on every boot (execute_config runs before the final static L2 entry).
+// on every boot (execute_config runs before the final static L2 entry). save
+// persists directly at the machine's MAC offset instead of the startup config,
+// and is ignored while replaying the startup config (save_cmd == 0).
 void parse_mac_cmd(void)
 {
 	if (cmd_words_len == 1) {
@@ -474,13 +555,18 @@ void parse_mac_cmd(void)
 		write_char('\n');
 		return;
 	}
-	if (cmd_words_len != 2 || !parse_mac(cmd_words_b[1])) {
-		cmd_error("mac [<aa:bb:cc:dd:ee:ff>]\n");
+	if ((cmd_words_len != 2 && (cmd_words_len != 3 || !cmd_compare(2, "save"))) || !parse_mac(cmd_words_b[1])) {
+		cmd_error("mac [<aa:bb:cc:dd:ee:ff> [save]]\n");
 		return;
 	}
 	if ((mac_parse_result[0] & 0x03) || ((mac_parse_result[0] | mac_parse_result[1] | mac_parse_result[2]) == 0)) {
 		cmd_error("the MAC must be unicast and globally administered\n");
 		return;
+	}
+	if (cmd_words_len == 3 && save_cmd) {
+		if (!save_mac_to_flash())
+			return;
+		print_string("MAC saved to flash\n");
 	}
 	if (memcmp(mac_parse_result, uip_ethaddr.addr, 6) == 0) {
 		print_string("MAC unchanged\n");
@@ -496,7 +582,8 @@ void parse_mac_cmd(void)
 	print_string("MAC set to: ");
 	print_mac(uip_ethaddr.addr);
 	write_char('\n');
-	print_string("Save the startup config to keep it across reboots\n");
+	if (cmd_words_len == 2)
+		print_string("Save the startup config to keep it across reboots\n");
 }
 
 
@@ -1981,6 +2068,9 @@ void cmd_parser(void) __banked
 			}
 		} else if (cmd_compare(0, "mac")) {
 			parse_mac_cmd();
+			// A direct flash save must never be queued in the startup config.
+			if (cmd_words_len == 3 && cmd_compare(2, "save"))
+				return;
 		} else if (cmd_compare(0, "hostname")) {
 			/* "hostname" alone reports the current name; "hostname <text>"
 			 * sets it, sanitized to JSON-safe printable ASCII. A name with
